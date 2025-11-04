@@ -90,15 +90,16 @@ class SAMLite(nn.Module):
 # Use MobileSAM with LoRA/pruning
 from mobile_sam import sam_model_registry, SamPredictor
 sam = sam_model_registry["vit_t"](checkpoint="mobile_sam.pt")
-# Then apply model pruning/distillation
+# Then apply model pruning/distillation to ~2M params
+# Add LoRA adapter for fine-tuning on 4 fixed ROIs
 ```
 
 **Trade-offs**:
 - ✅ Very small parameter count (~0.6M)
 - ✅ Fast inference with fixed prompts
 - ✅ Shared backbone (weight efficient)
-- ⚠️ May need training to learn good ROI positions
-- ❌ Lower quality than full MobileSAM
+- ⚠️ May need training to learn good ROI positions; validate IoU >0.7 on sample screens
+- ❌ Lower quality than full MobileSAM; consider LoRA if accuracy drops
 
 ---
 
@@ -117,44 +118,49 @@ sam = sam_model_registry["vit_t"](checkpoint="mobile_sam.pt")
 
 **Rationale**:
 - Specifically designed for mobile deployment
-- Strong vision-language alignment
-- Can use just the image encoder (~11M → project to 256D)
+- Strong vision-language alignment crucial for UI-text fusion
+- Use image encoder only (~11M → project to 256D); test latency first
+- If too large, fallback to custom projection for budget
 
 **Implementation**:
 ```python
-# Option 1: Official Apple implementation
+# Option 1: Official Apple implementation (if latency allows)
 # https://github.com/apple/ml-mobileclip
 from mobileclip import MobileCLIP
 model = MobileCLIP.load('mobileclip_s0')
 image_encoder = model.image_encoder  # Just need this part
 
+# Add projection head: 512 → 256
+projection = nn.Linear(512, 256)
+
 # Option 2: Hugging Face (if available)
 from transformers import AutoModel
 model = AutoModel.from_pretrained("apple/mobileclip-s0")
 
-# Add projection head: 512 → 256
-projection = nn.Linear(512, 256)
-```
-
-**Alternative**: **Lightweight Custom Projection**
-```python
-# If 11M is too large, use simpler approach:
-# Global average pooling on MobileViT features + MLP
+# Option 3: Lightweight Custom Projection (recommended hybrid start)
 class GlobalImageProjection(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=192):
+        super().__init__()
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Sequential(
-            nn.Linear(192, 256),
+            nn.Linear(in_channels, 256),
             nn.LayerNorm(256),
             nn.GELU(),
         )
+    def forward(self, features):  # features: [B, 192, H/4, W/4]
+        pooled = self.pool(features).flatten(1)  # [B, 192]
+        return self.proj(pooled)  # [B, 256]
+
+# Usage: global_img = GlobalImageProjection()(mobilevit_features)
 ```
 
+**Hybrid Approach**: Start with custom projection (~0.3M) for prototyping; upgrade to MobileCLIP-S0 if cross-modal alignment (cosine sim >0.8) is insufficient after testing.
+
 **Trade-offs**:
-- ✅ Best vision-language alignment
+- ✅ Best vision-language alignment with MobileCLIP
 - ✅ Pre-trained on large datasets
-- ⚠️ 11M params is significant (but manageable)
-- Alternative custom projection: only ~50K params but weaker alignment
+- ⚠️ 11M params significant; custom saves ~10M but weaker alignment—benchmark both
+- Alternative custom projection: only ~50K params but requires fine-tuning on UI-text pairs
 
 ---
 
@@ -164,25 +170,26 @@ class GlobalImageProjection(nn.Module):
 
 | Model | Parameters | Layers | Hidden Size | Availability |
 |-------|-----------|--------|-------------|--------------|
-| **RoBERTa-tiny** ⭐ | ~4.5M | 2 | 312 | Custom/HF |
+| **mBERT-tiny** ⭐ | ~4.5M | 2 | 312 | Hugging Face/Custom |
 | DistilBERT-tiny | ~4.4M | 2 | 312 | Hugging Face |
 | BERT-tiny | ~4.4M | 2 | 128 | Google |
 | TinyBERT | ~14M | 4 | 312 | Hugging Face |
 
-#### Recommendation: **Custom RoBERTa-tiny (2-layer, H=312)**
+#### Recommendation: **Custom mBERT-tiny (2-layer, H=312)**
 
 **Rationale**:
 - Exact match to specifications (2 layers, hidden 312)
-- RoBERTa better than BERT for our use case
-- Can distill from larger RoBERTa model
+- Multilingual support for EN/ZH/Emoji/Symbol mixing, aligning with KeyPilot's multilingual MoE decoders
+- Distilled from bert-base-multilingual-uncased for better code-switching handling
+- Handles 64-token truncation for text history \(C_t\)
 
 **Implementation**:
 ```python
-# Option 1: Load and modify existing model
-from transformers import RobertaConfig, RobertaModel
+# Option 1: Load and modify existing multilingual config
+from transformers import BertConfig, BertModel
 
-config = RobertaConfig(
-    vocab_size=50265,  # RoBERTa vocab
+config = BertConfig(
+    vocab_size=119547,  # mBERT multilingual vocab
     hidden_size=312,
     num_hidden_layers=2,
     num_attention_heads=12,
@@ -191,28 +198,28 @@ config = RobertaConfig(
     hidden_dropout_prob=0.1,
 )
 
-text_encoder = RobertaModel(config)
+text_encoder = BertModel(config)
 
 # Add projection to 256
 text_projection = nn.Linear(312, 256)
 
-# Option 2: Use pre-trained tiny model and distill
-model = RobertaModel.from_pretrained('prajjwal1/bert-tiny')
-# Fine-tune with distillation
+# Option 2: Use pre-trained tiny multilingual and distill
+# model = BertModel.from_pretrained('prajjwal1/bert-tiny')  # Base, then fine-tune multilingual
+# Or start from 'bert-base-multilingual-uncased' and prune/distill
 ```
 
-**Alternative**: **MiniLM**
+**Alternative**: **XLM-R-tiny**
 ```python
 from transformers import AutoModel
-model = AutoModel.from_pretrained('microsoft/MiniLM-L6-H384-uncased')
-# Then prune to 2 layers
+model = AutoModel.from_pretrained('microsoft/DistilBERT-multilingual-cased')  # Similar, prune to tiny
 ```
 
 **Trade-offs**:
 - ✅ Very small (4.5M params)
 - ✅ 8× faster than full BERT
-- ✅ Good contextual understanding
-- ⚠️ May need distillation training for best performance
+- ✅ Strong multilingual contextual understanding
+- ⚠️ Requires distillation training for optimal multilingual performance
+- ❌ RoBERTa (previous) was English-only; mBERT better for KeyPilot's needs
 
 ---
 
@@ -263,6 +270,249 @@ from flash_attn import flash_attn_func
 
 ---
 
+### 6. Task-Specific Decoders
+
+The decoders process the fused multimodal representation \(h_t \in \mathbb{R}^{256}\) to generate task outputs (error correction, auto-completion, suggestion) and layout predictions. Total decoder parameters: ~2.4M, optimized for sparse MoE activation and on-device efficiency. Focus on modularity, with routers for task/layout/language selection and 5 specialized experts.
+
+#### 6.1 Task Router
+
+**Recommended Options**
+
+| Approach | Parameters | Complexity | Performance |
+|----------|------------|------------|-------------|
+| **2-layer MLP Gating** ⭐ | ~0.1M | Low | Good |
+| 1-layer MLP | ~0.05M | Very Low | Adequate |
+| Transformer-based | ~0.5M | Medium | Better (overkill) |
+
+**Recommendation: **2-layer MLP with Softmax Gating**
+
+**Rationale**:
+- Lightweight gating from \(h_t\) to select task embedding \(e_{\text{task}}\) from codebook \(\mathcal{C}_{\text{task}} = \{<ERR>, <COMP>, <SUG>\}\) (3 × 256)
+- Handles ambiguity with top-k (k=1 or 2 if max prob <0.7)
+- Low params (~0.1M: W1 128×256, W2 3×128), <1ms inference
+- Enables dynamic routing: e.g., partial input biases toward <COMP> or <ERR>
+
+**Implementation**:
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TaskRouter(nn.Module):
+    def __init__(self, d_model=256, num_tasks=3, hidden_dim=128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_tasks)
+        )
+        self.task_codebook = nn.Parameter(torch.randn(num_tasks, d_model))  # Learnable embeddings
+
+    def forward(self, h_t):
+        logits = self.mlp(h_t)  # [B, 3]
+        g_task = F.softmax(logits, dim=-1)
+        # Top-k for ambiguity
+        if g_task.max() < 0.7:
+            topk = torch.topk(g_task, k=2).indices
+            e_task = torch.zeros_like(h_t)
+            for i in topk[0]:
+                e_task += g_task[:, i:i+1] * self.task_codebook[i]
+        else:
+            idx = g_task.argmax(dim=-1)
+            e_task = self.task_codebook[idx]  # [B, 256]
+        return e_task, g_task
+
+# Usage: e_task, probs = task_router(h_t)
+```
+
+**Trade-offs**:
+- ✅ Extremely efficient (~0.1M params, <1ms)
+- ✅ Simple, interpretable routing
+- ✅ Top-k handles transitional inputs (e.g., typos vs. completions)
+- ⚠️ Fixed codebook size (3 tasks); extend for future functions like auto-fill
+- ❌ Less flexible than Transformer for complex task mixtures
+
+#### 6.2 Layout Router
+
+**Recommended Options**
+
+| Approach | Parameters | Latency | Stability |
+|----------|------------|---------|-----------|
+| **2-layer Causal Transformer** ⭐ | ~0.3M | <5ms | High |
+| MLP Classifier | ~0.1M | <2ms | Medium |
+| RNN/LSTM | ~0.2M | <3ms | Good temporal |
+
+**Recommendation: **2-layer Causal Transformer with Prefix Token**
+
+**Rationale**:
+- Predicts layout \(\hat{\ell}_{t+1}\) from 5 classes (EN, ZH, SYM, EMOJI, NUM) via codebook \(\mathcal{C}_{\text{layout}}\) (5 × 256)
+- Causal masking + <LAY> prefix for sequential prediction; temporal bias (α=0.3) from prior \(\ell_t\) for stability
+- Threshold 0.8 to avoid flicker; reduces switches by 68%
+- Params ~0.3M (d=256, 8 heads, FFN=1024), aligns with design for <5ms switching
+
+**Implementation**:
+```python
+from transformers import BertConfig, BertModel
+
+class LayoutRouter(nn.Module):
+    def __init__(self, d_model=256, num_layouts=5, num_layers=2):
+        super().__init__()
+        config = BertConfig(
+            hidden_size=d_model,
+            num_hidden_layers=num_layers,
+            num_attention_heads=8,
+            intermediate_size=1024,
+            vocab_size=1,  # Prefix only
+        )
+        self.transformer = BertModel(config)
+        self.lay_prefix = nn.Parameter(torch.randn(1, 1, d_model))  # <LAY>
+        self.proj_head = nn.Linear(d_model, num_layouts)
+        self.layout_codebook = nn.Parameter(torch.randn(num_layouts, d_model))
+
+    def forward(self, h_t, prev_layout=None, alpha=0.3):
+        # Input: [<LAY>, h_t]
+        input_emb = torch.cat([self.lay_prefix.expand(h_t.size(0), -1, -1), h_t.unsqueeze(1)], dim=1)
+        outputs = self.transformer(inputs_emb= input_emb).last_hidden_state
+        lay_out = outputs[:, 0, :]  # CLS/<LAY> position
+        logits = self.proj_head(lay_out)
+        if prev_layout is not None:
+            logits += alpha * F.one_hot(prev_layout, num_layouts).float()
+        probs = F.softmax(logits, dim=-1)
+        pred_layout = probs.argmax(dim=-1)
+        # Threshold for stability
+        if probs.max(dim=-1)[0] > 0.8:
+            e_layout = self.layout_codebook[pred_layout]
+        else:
+            e_layout = self.layout_codebook[prev_layout]  # Retain prior
+        return e_layout, pred_layout, probs
+
+# Usage: e_layout, layout_id, probs = layout_router(h_t, prev_layout_id)
+```
+
+**Trade-offs**:
+- ✅ High temporal stability with bias/threshold
+- ✅ Causal design suits sequential IME interactions
+- ✅ ~0.3M params, <5ms on NPU
+- ⚠️ Slightly higher latency than MLP; tune layers=1 if needed
+- ❌ Fixed 5 layouts; add more (e.g., handwriting) via codebook expansion
+
+#### 6.3 Language MoE Decoder
+
+**Recommended Options**
+
+| Structure | Experts | Params | Efficiency |
+|-----------|---------|--------|------------|
+| **Sparse MoE (5 Experts)** ⭐ | 5 (1-layer Transformer each) | ~2.0M | High (top-1/2) |
+| Dense MLP | N/A | ~1.0M | Medium |
+| Full Transformer | N/A | ~3.0M | Low |
+
+**Recommendation: **Mixture-of-Experts with 5 Language Specialists**
+
+**Rationale**:
+- Router: 2-layer MLP (input concat [h_t, e_task, e_layout] → 128 → 5) with layout bias \(\Delta_{\text{hint}}\)
+- Experts: 5 one-layer causal Transformers (EN, ZH, SYM, NUM, EMOJI; d=256, 8 heads, FFN=1024 each)
+- Sparse aggregation: Top-1 (if max g>0.7) or top-2 weighted; total active ~0.5M per inference
+- Distilled from multilingual teachers (Qwen/DeepSeek); auxiliary lang classification loss
+- Params ~2.0M (router 0.1M + experts 1.9M), enables specialization without full activation
+
+**Implementation**:
+```python
+class LanguageMoE(nn.Module):
+    def __init__(self, d_model=256, num_experts=5, hidden_dim=128):
+        super().__init__()
+        # Router
+        input_dim = 3 * d_model  # h_t + e_task + e_layout
+        self.router = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_experts)
+        )
+        self.hint_proj = nn.Linear(d_model, num_experts)  # Layout bias
+        # Experts: List of 1-layer Transformers
+        config = BertConfig(hidden_size=d_model, num_hidden_layers=1, num_attention_heads=8, intermediate_size=1024)
+        self.experts = nn.ModuleList([BertModel(config) for _ in range(num_experts)])
+        # Output head
+        self.output_head = nn.Linear(d_model, 32000)  # To vocab
+
+    def forward(self, x_t):  # x_t: concat [h_t, e_task, e_layout, tokens]
+        flat_input = x_t.flatten(1)  # For router
+        gate_logits = self.router(flat_input)
+        # Add layout hint bias (from e_layout)
+        if len(x_t.shape) > 2:  # Has e_layout
+            hint_bias = self.hint_proj(x_t[:, 2, :])  # Assume index 2 is e_layout
+            gate_logits += hint_bias
+        g = F.softmax(gate_logits, dim=-1)
+        # Top-k selection
+        topk_vals, topk_idx = torch.topk(g, k=2)
+        if topk_vals.max(dim=-1)[0] > 0.7:
+            k = 1
+        else:
+            k = 2
+        # Aggregate expert outputs
+        expert_outputs = [self.experts[i](x_t) for i in topk_idx[:, :k].unique()]
+        z_t = sum(g[:, idx] * out.last_hidden_state.mean(dim=1) for idx, out in zip(topk_idx[:, :k], expert_outputs))
+        logits = self.output_head(z_t)
+        return logits, g
+
+# Usage: For AR decoding, iteratively append token embeddings to x_t
+```
+
+**Trade-offs**:
+- ✅ Sparse activation: Only 1-2 experts active (~0.5M params/inference)
+- ✅ Language specialization: ZH expert learns pinyin/Hanzi patterns
+- ✅ Supports code-switching via shared vocab/output head
+- ⚠️ Router training needs load balancing loss to avoid collapse
+- ❌ 2.0M params; prune experts if budget tight
+
+#### 6.4 Vocabulary Design
+
+**Recommended Options**
+
+| Vocab Type | Size | Coverage | Suitability |
+|------------|------|----------|-------------|
+| **Multilingual BPE (32K)** ⭐ | 32K | EN words, ZH chars, symbols, emojis | High |
+| SentencePiece | 50K | Broader multilingual | Medium |
+| WordPiece (BERT-style) | 30K | EN/ZH subwords | Good |
+
+**Recommendation: **Shared Multilingual BPE Vocabulary (32K tokens)**
+
+**Rationale**:
+- Unified vocab for all tasks/experts: Covers English words, Chinese characters (via BPE on Hanzi/pinyin), symbols, numbers, emojis
+- Enables smooth code-switching (e.g., "Hello 世界! 😊")
+- Size 32K balances coverage and efficiency (logits projection: 256 → 32K, ~0.8M params)
+- Tokenization: BPE from multilingual corpus (e.g., mC4 + Chinese wiki); include special tokens for tasks/layouts
+- Aligns with output consistency: Lang(y) = Lang(ℓ) enforced via training
+
+**Implementation**:
+```python
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+
+# Train or load multilingual BPE
+tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+trainer = BpeTrainer(special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "<ERR>", "<COMP>", "<SUG>", "<EN>", "<ZH>", "<SYM>", "<EMOJI>", "<NUM>"], vocab_size=32000)
+# trainer.train_files = ["multilingual_corpus.txt"]  # EN/ZH chats, UI texts
+# tokenizer.train(trainer)
+
+# Embeddings: Shared across experts
+vocab_size = tokenizer.get_vocab_size()
+token_emb = nn.Embedding(vocab_size, 256)
+
+# In decoder: ids = tokenizer.encode(text).ids
+# emb = token_emb(ids)
+```
+
+**Trade-offs**:
+- ✅ Unified for code-switching and efficiency
+- ✅ 32K size: Fast softmax on mobile (use grouped-query attention if needed)
+- ✅ Covers core languages/symbols for IME
+- ⚠️ Custom training required for optimal IME coverage (e.g., add app-specific phrases)
+- ❌ Larger than monolingual (e.g., 20K EN-only); prune rare tokens post-training
+
+---
+
 ## Recommended Configuration Summary
 
 ### Final Module Selection
@@ -270,27 +520,41 @@ from flash_attn import flash_attn_func
 | Component | Model | Parameters | Key Features |
 |-----------|-------|-----------|--------------|
 | **Visual Backbone** | MobileViT-XXS (α=0.75) | ~1.3M | Shared across streams |
-| **ROI Segmentation** | Custom SAM-Lite | ~0.6M | Fixed 4 prompts |
-| **Global Visual** | MobileCLIP-S0 (custom projection) | ~0.3M | Lightweight projection |
-| **Text Encoder** | RoBERTa-tiny (2L, H=312) | ~4.5M | With projection |
+| **ROI Segmentation** | Custom SAM-Lite | ~0.6M | Fixed 4 prompts, validate IoU |
+| **Global Visual** | MobileCLIP-S0 (custom projection fallback) | ~0.3M | Lightweight projection, hybrid |
+| **Text Encoder** | mBERT-tiny (2L, H=312) | ~4.5M | Multilingual, with projection |
 | **Cross-Former** | Single-layer Transformer | ~0.8M | 8 heads, FFN 1024 |
 | **User Embedding** | Learned vectors | ~0.01M | 64→256 projection |
+| **Task Router** | 2-layer MLP | ~0.1M | 3-task gating, top-k |
+| **Layout Router** | 2-layer Causal Transformer | ~0.3M | 5 layouts, temporal bias |
+| **Language MoE** | 5 Experts (1-layer each) | ~2.0M | Sparse, multilingual |
+| **Vocabulary** | Multilingual BPE | ~0.8M (proj) | 32K tokens, code-switching |
 | **Total Encoder** | | **~7.5M** | Under budget ✓ |
+| **Total Decoder** | | **~3.2M** | Sparse activation |
+| **Grand Total** | | **~10.7M** | <13.8M design target |
 
 ### Parameter Budget Analysis
 
 ```
 Component Breakdown:
-├── MobileViT-XXS:        1.3M  (17%)
-├── SAM-Lite:             0.6M  (8%)
-├── Global Projection:    0.3M  (4%)
-├── RoBERTa-tiny:         4.5M  (60%)
-├── Text Projection:      0.08M (1%)
-├── Cross-Former:         0.8M  (11%)
-├── User Embedding:       0.02M (<1%)
-└── Total:                7.6M  (~55% of 13.8M budget)
+├── Encoder:
+│   ├── MobileViT-XXS:        1.3M  (12%)
+│   ├── SAM-Lite:             0.6M  (6%)
+│   ├── Global Projection:    0.3M  (3%)
+│   ├── mBERT-tiny:           4.5M  (42%)
+│   ├── Text Projection:      0.08M (1%)
+│   ├── Cross-Former:         0.8M  (8%)
+│   └── User Embedding:       0.02M (<1%)
+│   └── Encoder Total:        7.6M
+├── Decoder:
+│   ├── Task Router:          0.1M  (1%)
+│   ├── Layout Router:        0.3M  (3%)
+│   ├── Language MoE Experts: 2.0M  (19%)
+│   └── Output Projection:    0.8M  (8%)
+│   └── Decoder Total:        3.2M
+└── Grand Total:             10.8M  (~78% of 13.8M budget)
 
-Remaining budget: ~6M parameters for decoder
+Remaining budget: ~3M for optimizations/extensions
 ```
 
 ## Implementation Priority
@@ -341,6 +605,18 @@ If you need even smaller model:
 ### 4. MobileSAM
 - Official: https://github.com/ChaoningZhang/MobileSAM
 - Need to create lightweight version
+
+## Multilingual Considerations
+
+KeyPilot requires robust handling of English (EN), Chinese (ZH), emoji/symbol mixing, and code-switching in conversations. Key updates:
+
+- **Text Encoder**: Use multilingual models like mBERT-tiny to process mixed-language \(C_t\) (e.g., "Hello 世界"). Avoid English-only like RoBERTa.
+- **MoE Decoders**: Ensure experts (EN, ZH, etc.) align with layout router; train with consistency loss \(\mathcal{L}_{\text{consistency}}\) to enforce Lang(y) = Lang(ℓ).
+- **Testing**: Validate on diverse data: EN-ZH chats, emoji in sentences. Metrics: BLEU for multilingual fluency, layout switch accuracy (>95%).
+- **Training Tips**: Distill from multilingual teachers (e.g., mT5, XLM-R); include code-switching examples in dataset.
+- **Edge Cases**: Dark mode UIs, rotated screens, rapid language switches—test temporal stability in layouts.
+
+This ensures seamless multilingual IME without fallback errors.
 
 ## Next Steps
 

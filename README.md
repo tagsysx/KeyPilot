@@ -4,6 +4,8 @@
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
+**⚠️ Note: This project is under active development. Features, APIs, and documentation may change. Contributions are welcome!**
+
 KeyPilot is a vision-language typing agent that activates keyboard intelligence by jointly understanding the visual context of the user's screen and the linguistic context of conversations. The system predicts both the next input intent (e.g., text, symbol, emoji, or numeric) and the optimal keyboard layout, grounding predictions in multimodal reasoning.
 
 ## 🌟 Key Features
