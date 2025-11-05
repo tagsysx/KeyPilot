@@ -10,9 +10,9 @@ In this section, we formally define the intelligent IME problem and provide a hi
 
 KeyPilot extends conventional IMEs by integrating on-screen perception with joint vision-language context understanding. It provides four core functionalities:
 
-- **Auto-Completion**: Predicts the next word or phrase based on the user's partial input and surrounding visual-textual context, enabling content-aware completion beyond standard language models.
+- **Auto-Completion**: Predicts the next word or phrase based on the user's partial input and surrounding visual-textual context, enabling content-aware completion beyond standard language models. Provides **N candidate suggestions** (typically N=5) ranked by confidence, allowing users to select the most appropriate completion.
 
-- **Semantic Error Correction**: Detects and corrects typos or inconsistencies by jointly analyzing visual and textual context (e.g., "I ate appl" near an apple image → "I ate an apple"). Multimodal cues improve correction accuracy over language-only approaches.
+- **Semantic Error Correction**: Detects and corrects typos or inconsistencies by jointly analyzing visual and textual context (e.g., "I ate appl" near an apple image → "I ate an apple"). Multimodal cues improve correction accuracy over language-only approaches. Offers **N candidate corrections** (typically N=5) for user selection, accommodating ambiguous cases.
 
 - **Adaptive Layout Switching**: Dynamically selects the optimal keyboard layout (e.g., QWERTY for English, T9 for Chinese, numeric, emoji, handwriting) based on input field semantics, app context, and visual scene, reducing manual layout switching.
 

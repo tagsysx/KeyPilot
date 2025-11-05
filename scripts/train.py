@@ -395,11 +395,14 @@ def evaluate(model, dataloader, device, criterion, output_dir=None, epoch=None):
             total_layout_correct += (pred_layout == layout_label).sum().item()
             
             # Compute text prediction accuracy (token-level)
+            # For auto-completion and error-correction: use top-N accuracy
+            # For suggestion: use exact match accuracy
             if 'logits' in outputs:
                 logits = outputs['logits']  # [B, seq_len, vocab_size] or [B, vocab_size]
                 
                 if logits.dim() == 3:
                     # Multi-token prediction (suggestion task)
+                    # Use exact match for suggestion task
                     pred_tokens = logits.argmax(dim=-1)  # [B, seq_len]
                     pred_length = pred_tokens.size(1)  # Always use prediction length
 
@@ -412,10 +415,19 @@ def evaluate(model, dataloader, device, criterion, output_dir=None, epoch=None):
                         total_tokens += pred_length
                 else:
                     # Single-token prediction (completion/error tasks)
-                    pred_tokens = logits.argmax(dim=-1)  # [B]
-                    target = target_token_ids[:, 0]  # Take first token
-                    total_text_correct += (pred_tokens == target).sum().item()
-                    total_tokens += pred_tokens.size(0)
+                    # Use top-N accuracy: correct if ground truth is in top N candidates
+                    num_candidates = 5  # Default N=5
+                    target = target_token_ids[:, 0]  # Take first token [B]
+                    
+                    # Get top-N predictions
+                    top_n_probs, top_n_tokens = torch.topk(logits, k=num_candidates, dim=-1)
+                    # top_n_tokens: [B, N]
+                    
+                    # Check if target is in any of the N candidates
+                    target_expanded = target.unsqueeze(1).expand_as(top_n_tokens)  # [B, N]
+                    matches = (top_n_tokens == target_expanded).any(dim=1)  # [B]
+                    total_text_correct += matches.sum().item()
+                    total_tokens += target.size(0)
             
             total_samples += image.size(0)
     

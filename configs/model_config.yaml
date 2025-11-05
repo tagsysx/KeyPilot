@@ -149,7 +149,11 @@ data:
   test_data: "data/test"
 
 inference:
-  # Generation settings
+  # Candidate generation for completion/error-correction
+  num_candidates: 5  # Number of candidates to generate
+  candidate_temperature: 1.0  # Temperature for candidate diversity
+  
+  # Suggestion generation (autoregressive)
   max_length: 5
   temperature: 1.0
   top_k: 50

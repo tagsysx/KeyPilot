@@ -414,6 +414,7 @@ class LayoutRouter(nn.Module):
 - Sparse aggregation: Top-1 (if max g>0.7) or top-2 weighted; total active ~0.5M per inference
 - Distilled from multilingual teachers (Qwen/DeepSeek); auxiliary lang classification loss
 - Params ~2.0M (router 0.1M + experts 1.9M), enables specialization without full activation
+- **N-Candidate Generation**: For auto-completion and error-correction, generates N=5 candidates using top-k sampling, allowing users to select from multiple options. Accuracy evaluated using top-N metric (correct if ground truth in any candidate).
 
 **Implementation**:
 ```python

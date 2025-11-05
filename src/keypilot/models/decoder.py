@@ -205,16 +205,21 @@ class LanguageMoE(nn.Module):
     
     Experts: EN, ZH, SYM, NUM, EMOJI
     Parameters: ~2.0M
+    
+    For auto-completion and error-correction tasks, generates N candidates
+    (default N=5) using top-k sampling, providing users with multiple options.
     """
     
     def __init__(self, 
                  d_model: int = 256, 
                  num_experts: int = 5,
                  vocab_size: int = 32000,
-                 hidden_dim: int = 128):
+                 hidden_dim: int = 128,
+                 num_candidates: int = 5):
         super().__init__()
         self.num_experts = num_experts
         self.d_model = d_model
+        self.num_candidates = num_candidates
         
         # Router: 2-layer MLP
         input_dim = 3 * d_model  # h_t + e_task + e_layout
@@ -465,6 +470,56 @@ class KeyPilotDecoder(nn.Module):
         }
         
         return generated_tokens, metadata
+    
+    def generate_candidates(self,
+                           h_t: torch.Tensor,
+                           prev_layout: Optional[torch.Tensor] = None,
+                           num_candidates: int = 5,
+                           temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """
+        Generate N candidate tokens for auto-completion or error-correction tasks.
+        
+        This method generates multiple ranked candidates for non-autoregressive tasks,
+        allowing users to select from multiple options. The candidates are ranked by
+        their model confidence (logit values).
+        
+        Args:
+            h_t: Multimodal representation [B, 256]
+            prev_layout: Previous layout IDs [B] for temporal stability
+            num_candidates: Number of candidates to generate (default: 5)
+            temperature: Sampling temperature for diversity
+        
+        Returns:
+            candidate_tokens: Top-N candidate token IDs [B, num_candidates]
+            candidate_probs: Probabilities for each candidate [B, num_candidates]
+            metadata: Dictionary with task_probs, layout_id, layout_probs, expert_probs
+        """
+        B = h_t.size(0)
+        
+        # Task and layout routing
+        e_task, task_probs = self.task_router(h_t)
+        e_layout, layout_id, layout_probs = self.layout_router(h_t, prev_layout)
+        
+        # Get logits from MoE (non-autoregressive)
+        logits, expert_probs = self.language_moe(h_t, e_task, e_layout, token_embeds=None)
+        
+        # Apply temperature
+        logits = logits / temperature  # [B, vocab_size]
+        
+        # Get top-N candidates
+        probs = F.softmax(logits, dim=-1)  # [B, vocab_size]
+        candidate_probs, candidate_tokens = torch.topk(probs, k=num_candidates, dim=-1)
+        # candidate_tokens: [B, num_candidates]
+        # candidate_probs: [B, num_candidates]
+        
+        metadata = {
+            'task_probs': task_probs,
+            'layout_id': layout_id,
+            'layout_probs': layout_probs,
+            'expert_probs': expert_probs
+        }
+        
+        return candidate_tokens, candidate_probs, metadata
     
     def get_num_parameters(self) -> Dict[str, int]:
         """Get parameter counts for each component."""

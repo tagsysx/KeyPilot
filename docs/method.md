@@ -216,7 +216,7 @@ $$
 
 where \(\mathcal{K}\) is the top-\(k\) expert index set and \(\mathcal{E}_i(\cdot)\) denotes each expert's Transformer block with residual and normalization layers. A top-1 policy is applied when \(\max(g) > 0.7\), otherwise top-2 with weighted mixing to preserve diversity.
 
-For the *suggestion* task, \(z_t\) initializes autoregressive decoding with speculative sampling (lookahead 2, beam width 4) under causal masking, while *correction* and *completion* use non-autoregressive single-step projection.
+For the *suggestion* task, \(z_t\) initializes autoregressive decoding with speculative sampling (lookahead 2, beam width 4) under causal masking. For *correction* and *completion* tasks, the model generates **N candidate tokens** (typically N=5) using top-k sampling or beam search, providing users with multiple ranked options to choose from.
 
 The final representation \(z_t\) is projected onto a shared multilingual vocabulary (\(|V|=32\)K, mixed BPE covering English words, Chinese characters, symbols, and emojis):
 
@@ -323,9 +323,9 @@ $$
 where \(\mathcal{Y}\) represents the target token sequence, \(y_i\) is the \(i\)-th target token, \(h_t\) is the multimodal context, \(e_{\text{task}}\) is the task-specific embedding, and \(\mathbf{y}_{<i}\) are the previously generated tokens. The loss is computed autoregressively for sequence generation tasks (e.g., suggestion with \(N=5\) tokens) and uses teacher forcing during training. Ground-truth targets are derived from user interaction logs, including post-edit corrections, accepted completions, and validated suggestions.
 
 For different tasks:
-- **Error Correction**: Single-token prediction (\(|\mathcal{Y}|=1\)) replacing the erroneous input
-- **Auto-Completion**: Single-token prediction (\(|\mathcal{Y}|=1\)) extending the current input
-- **Suggestion**: Multi-token sequence (\(|\mathcal{Y}|=5\)) providing contextual alternatives
+- **Error Correction**: Generates **N candidates** (\(N=5\)) for correcting the erroneous input. During training, the loss is computed over the single ground-truth token. During evaluation, accuracy is computed as "correct if any candidate matches the ground truth" (top-N accuracy).
+- **Auto-Completion**: Generates **N candidates** (\(N=5\)) for extending the current input. Similar to error correction, uses top-N accuracy metric where a prediction is correct if the ground truth appears in any of the N candidates.
+- **Suggestion**: Multi-token sequence (\(|\mathcal{Y}|=5\)) providing contextual alternatives using autoregressive generation
 
 #### Layout Prediction Loss
 

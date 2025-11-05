@@ -296,6 +296,7 @@ KeyPilot uses a lightweight Vision-Language architecture optimized for on-device
 - **Layout Router**: 2-layer Transformer (EN/ZH/SYM/EMOJI/NUM) - 0.3M params
 - **Language MoE**: 5 expert decoders with sparse activation - 2.0M params
 - **Vocabulary**: Shared 32K multilingual BPE - 0.8M params
+- **N-Candidate Generation**: For auto-completion and error-correction, generates N=5 candidates ranked by confidence, allowing users to select the most appropriate option. Evaluation uses top-N accuracy metric.
 
 ### Total: ~10.7M parameters (< 50MB after INT8 quantization)
 
