@@ -45,7 +45,7 @@ KeyPilot/
 │   ├── finetuned/         # Fine-tuned models
 │   └── distilled/         # Distilled on-device models
 ├── configs/               # Configuration files
-├── experiments/           # Training experiments
+├── results/               # Training results and checkpoints
 ├── logs/                  # Training logs
 ├── tests/                 # Unit tests
 ├── notebooks/             # Jupyter notebooks
@@ -80,7 +80,14 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Set up API keys (for data generation):
+4. Run the quickstart example:
+```bash
+python examples/quickstart.py
+```
+
+This will demonstrate model initialization, forward pass, and prediction capabilities.
+
+5. Set up API keys (for data generation, optional):
 ```bash
 export OPENAI_API_KEY="your-openai-key"
 export DEEPSEEK_API_KEY="your-deepseek-key"
@@ -134,47 +141,35 @@ train_path, val_path, test_path = preprocessor.split_dataset(
 
 ### Model Training
 
-Train the KeyPilot model:
+Train the KeyPilot model with the provided script:
+
+```bash
+python scripts/train.py --config configs/model_config.yaml --use_wandb
+```
+
+Or programmatically:
 
 ```python
-from keypilot import KeyPilotVLM, KeyPilotTrainer
-from keypilot.data import KeyPilotDataset
-from keypilot.utils import KeyPilotConfig
+import yaml
+from keypilot.models import create_keypilot_model, KeyPilotLoss
 
 # Load configuration
-config = KeyPilotConfig()
+with open('configs/model_config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
 
-# Initialize model
-model = KeyPilotVLM(
-    config=config.model,
-    intent_classes=config.intent_classes,
-    layout_types=config.layout_types,
-)
+# Create model
+model = create_keypilot_model(config['model'])
 
-# Load datasets
-train_dataset = KeyPilotDataset(
-    data_path="data/processed/train.json",
-    processor=model.processor,
-    intent_classes=config.intent_classes,
-    layout_types=config.layout_types,
-)
+# Print model summary
+summary = model.get_model_summary()
+print(f"Total parameters: {summary['total_parameters']:,}")
+print(f"Model size (INT8): {summary['model_size_mb_int8']:.2f} MB")
 
-val_dataset = KeyPilotDataset(
-    data_path="data/processed/val.json",
-    processor=model.processor,
-    intent_classes=config.intent_classes,
-    layout_types=config.layout_types,
-)
+# Create loss function
+criterion = KeyPilotLoss(**config['training']['loss'])
 
-# Train model
-trainer = KeyPilotTrainer(
-    model=model,
-    train_dataset=train_dataset,
-    val_dataset=val_dataset,
-    config=config.training,
-)
-
-trainer.train()
+# TODO: Implement dataloaders and training loop
+# See scripts/train.py for full training implementation
 ```
 
 ### Model Evaluation
@@ -189,7 +184,7 @@ from keypilot.utils import ModelConfig
 # Load model
 config = ModelConfig()
 model = KeyPilotVLM.from_pretrained(
-    model_dir="experiments/best_model",
+    model_dir="results/best_model",
     config=config,
 )
 
@@ -212,26 +207,44 @@ evaluator.save_results(metrics, ".temp/evaluation_results.json")
 Make predictions with trained model:
 
 ```python
+import torch
 from PIL import Image
-from keypilot import KeyPilotVLM
-from keypilot.utils import ModelConfig
+from keypilot.models import KeyPilotVLM
+from keypilot.utils.vocabulary import KeyPilotVocabulary
 
 # Load model
-model = KeyPilotVLM.from_pretrained(
-    model_dir="experiments/best_model",
-    config=ModelConfig(),
+model = KeyPilotVLM(
+    vocab_size=32000,
+    d_model=256,
+    num_tasks=3,
+    num_layouts=5,
+    num_experts=5,
+    pretrained_backbone=True
 )
+model.eval()
 
-# Load screen image
-image = Image.open("screen_capture.png")
+# Load tokenizer
+vocab = KeyPilotVocabulary()
+vocab.load("models/tokenizer/tokenizer.json")
 
-# Conversation text
-conversation = "Hey, how are you? I'm doing great! What about"
+# Prepare inputs
+image = torch.randn(1, 3, 512, 256)  # Replace with actual screen capture
+text = "Hey, how are you? I'm doing great! What about"
+encoded = vocab.encode(text, max_length=64)
+input_ids = torch.tensor([encoded['input_ids']])
+attention_mask = torch.tensor([encoded['attention_mask']])
 
 # Predict
-intent, layout = model.predict(image, conversation)
-print(f"Predicted intent: {intent}")
-print(f"Optimal layout: {layout}")
+predictions = model.predict(
+    image=image,
+    input_ids=input_ids,
+    attention_mask=attention_mask,
+    temperature=0.9
+)
+
+print(f"Task: {predictions[0]['task']}")
+print(f"Layout: {predictions[0]['layout']}")
+print(f"Confidence: {predictions[0]['task_confidence']:.3f}")
 ```
 
 ## 🔧 Configuration
@@ -267,18 +280,40 @@ data:
   num_agents: 4
 ```
 
-## 📊 Model Performance
+## 📊 Model Architecture
 
-Performance metrics on test set:
+KeyPilot uses a lightweight Vision-Language architecture optimized for on-device deployment:
 
-| Metric | Intent Prediction | Layout Prediction |
-|--------|------------------|-------------------|
-| Accuracy | TBD | TBD |
-| Precision | TBD | TBD |
-| Recall | TBD | TBD |
-| F1 Score | TBD | TBD |
+### Encoder (~7.5M parameters, ≤19ms)
+- **Visual Backbone**: MobileViT-XXS (α=0.75) - 1.3M params
+- **ROI Segmentation**: SAM-Lite with 4 fixed regions - 0.6M params
+- **Global Features**: Lightweight projection - 0.3M params
+- **Text Encoder**: mBERT-tiny (2 layers, multilingual) - 4.5M params
+- **Cross-Former**: Single-layer fusion - 0.8M params
 
-*Note: Train your model and run evaluation to populate these metrics.*
+### Decoder (~3.2M parameters, <10ms)
+- **Task Router**: 2-layer MLP (error/completion/suggestion) - 0.1M params
+- **Layout Router**: 2-layer Transformer (EN/ZH/SYM/EMOJI/NUM) - 0.3M params
+- **Language MoE**: 5 expert decoders with sparse activation - 2.0M params
+- **Vocabulary**: Shared 32K multilingual BPE - 0.8M params
+
+### Total: ~10.7M parameters (< 50MB after INT8 quantization)
+
+For detailed design rationale, see [docs/module_selection.md](docs/module_selection.md).
+
+## 📊 Performance Targets
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| Total Latency | < 50ms | End-to-end on mobile NPU |
+| Encoder Latency | ≤ 19ms | Vision-language fusion |
+| Decoder Latency | < 10ms | Task output generation |
+| Model Size | < 50MB | After INT8 quantization |
+| RAM Usage | < 100MB | Peak memory |
+| Task Accuracy | > 90% | Error/completion/suggestion |
+| Layout Accuracy | > 95% | EN/ZH/SYM/EMOJI/NUM |
+
+*Note: Train your model and run evaluation to measure actual performance.*
 
 ## 🔬 Model Distillation
 
@@ -289,7 +324,7 @@ from keypilot.models import DistillationTrainer
 from keypilot.utils import DistillationConfig
 
 # Load teacher and student models
-teacher_model = KeyPilotVLM.from_pretrained("experiments/best_model", config)
+teacher_model = KeyPilotVLM.from_pretrained("results/best_model", config)
 student_model = KeyPilotVLM(student_config, intent_classes, layout_types)
 
 # Distill
@@ -357,14 +392,22 @@ For questions or collaborations, please open an issue or contact [your-email@exa
 ## 🗺️ Roadmap
 
 - [x] Initial project setup
-- [x] Multi-agent data generation pipeline
-- [x] Vision-language model architecture
-- [x] Training and evaluation pipeline
+- [x] Design principles and architecture documentation
+- [x] Module selection and component design
+- [x] Encoder implementation (MobileViT, SAM-Lite, mBERT-tiny)
+- [x] Decoder implementation (Task/Layout routers, MoE)
+- [x] Complete KeyPilot VLM model
+- [x] Training script and configuration
+- [x] Unit tests and quickstart example
+- [ ] Multilingual tokenizer training (32K BPE)
+- [ ] Dataset preparation and data loaders
+- [ ] Multi-agent data generation pipeline
+- [ ] Model training and validation
 - [ ] Collect and label real mobile typing data
-- [ ] Train production model
-- [ ] Model quantization and optimization
-- [ ] Mobile SDK development
-- [ ] iOS/Android keyboard integration
+- [ ] Model quantization (INT8) and optimization
+- [ ] ONNX/TensorRT export for mobile
+- [ ] Mobile SDK development (iOS/Android)
+- [ ] Keyboard integration and testing
 - [ ] User study and evaluation
 
 ---

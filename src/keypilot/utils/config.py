@@ -48,7 +48,7 @@ class DataConfig:
 class TrainingConfig:
     """Configuration for model training."""
     
-    output_dir: str = "experiments"
+    output_dir: str = "results"
     num_epochs: int = 10
     batch_size: int = 4
     gradient_accumulation_steps: int = 8

@@ -241,16 +241,15 @@ The MoE architecture offers a principled balance between model capacity and comp
 
 ## Training Objective
 
-The model is trained end-to-end using a multitask loss that jointly optimizes the vision–language encoder and task-specific decoders, while incorporating knowledge distillation for efficient transfer from larger pretrained models. This formulation preserves encoder–decoder modularity, allowing staged training and lightweight fine-tuning under mobile resource constraints:
+The model is trained end-to-end using a multitask loss that jointly optimizes the vision–language encoder and task-specific decoders through carefully balanced objectives. The loss formulation maintains encoder–decoder modularity while ensuring robust multimodal alignment and task performance:
 
 $$
 \mathcal{L}_{\text{total}} =
 \lambda_{\text{enc}} \mathcal{L}_{\text{enc}} +
-\lambda_{\text{dec}} \mathcal{L}_{\text{dec}} +
-\lambda_{\text{dist}} \mathcal{L}_{\text{dist}}
+\lambda_{\text{dec}} \mathcal{L}_{\text{dec}}
 $$
 
-where \(\lambda_{\text{enc}}=0.3\), \(\lambda_{\text{dec}}=1.0\), and \(\lambda_{\text{dist}}=0.5\) are determined via grid search on a validation set of multimodal IME interactions. Decoupled encoder and decoder losses enable incremental updates (e.g., adapting to new layouts or user behaviors) without full retraining.
+where $\lambda_{\text{enc}}{=}0.3$ and $\lambda_{\text{dec}}{=}1.0$ are empirically tuned weights that balance encoder alignment with decoder task performance. This decoupled structure enables incremental updates and fine-tuning under mobile resource constraints.
 
 ### Encoder Loss
 
@@ -258,130 +257,126 @@ The encoder \(\mathbf{E}(\cdot)\) is trained with self-supervised objectives tha
 
 $$
 \mathcal{L}_{\text{enc}} =
-\mathcal{L}_{\text{align}} +
-0.2 \, \mathcal{L}_{\text{contrastive}}
+\lambda_{\text{align}} \mathcal{L}_{\text{align}} +
+\lambda_{\text{contrastive}} \mathcal{L}_{\text{contrastive}}
 $$
 
-where both losses operate on intermediate tokens before the Cross-Former fusion layer.
+where $\lambda_{\text{align}}{=}1.0$ and $\lambda_{\text{contrastive}}{=}0.2$ weight the alignment and contrastive losses, both operating on intermediate tokens before the Cross-Former fusion layer.
 
 #### Cross-Modal Alignment
 
-We adopt a momentum contrastive learning framework to align global visual and textual embeddings without requiring paired supervision. For a batch of \(B\) samples, let \(v_i = [\text{IMG}]_i\) and \(t_i = [\text{CLS}_{\text{text}}]_i\) represent the visual and textual anchors from the same timestep. The alignment loss encourages matched pairs to be close in the shared space while pushing apart negatives:
+We adopt an InfoNCE contrastive learning framework to align global visual and textual embeddings without requiring paired supervision. For a batch of \(B\) samples, let \(v_i = [\text{IMG}]_i \in \mathbb{R}^{256}\) and \(t_i = [\text{CLS}_{\text{text}}]_i \in \mathbb{R}^{256}\) represent the L2-normalized visual and textual anchors from the same timestep. The alignment loss encourages matched pairs to be close in the shared embedding space while pushing apart negatives:
 
 $$
 \mathcal{L}_{\text{align}} =
 -\frac{1}{B} \sum_{i=1}^{B}
 \log
 \frac{
-\exp(\text{sim}(v_i, t_i)/\tau)
+\exp(\langle v_i, t_i \rangle / \tau)
 }{
-\sum_{j=1}^{B} \exp(\text{sim}(v_i, t_j)/\tau)
+\sum_{j=1}^{B} \exp(\langle v_i, t_j \rangle / \tau)
 }
 $$
 
-where \(\text{sim}(\cdot,\cdot)\) denotes cosine similarity, \(\tau=0.07\) is the temperature, and a momentum-updated queue of negatives ensures scalable training. This objective allows the encoder to implicitly learn UI–text correspondences (e.g., associating chat bubbles with conversational intent).
+where \(\langle \cdot, \cdot \rangle\) denotes the dot product (equivalent to cosine similarity for normalized vectors), \(\tau = 0.07\) is the temperature parameter that controls the softness of the distribution, and the summation over \(j\) includes both positive pairs (\(j=i\)) and negative pairs from the same batch. This objective allows the encoder to implicitly learn UI–text correspondences (e.g., associating chat bubbles with conversational intent and input fields with correction needs).
 
 #### Contrastive Regularization
 
-To refine local feature alignment, we apply an auxiliary InfoNCE loss between region-of-interest (ROI) tokens and textual embeddings:
+To refine local feature alignment and promote spatial awareness, we apply an auxiliary InfoNCE loss between aggregated region-of-interest (ROI) tokens and textual embeddings:
 
 $$
 \mathcal{L}_{\text{contrastive}} =
 -\frac{1}{B} \sum_{i=1}^{B}
 \log
 \frac{
-\exp(\text{sim}(\bar{r}_i, t_i)/\tau)
+\exp(\langle \bar{r}_i, t_i \rangle / \tau)
 }{
-\sum_{k=1}^{B} \exp(\text{sim}(\bar{r}_i, t_k)/\tau)
+\sum_{k=1}^{B} \exp(\langle \bar{r}_i, t_k \rangle / \tau)
 }
 $$
 
-where \(\bar{r}_i = \frac{1}{4}\sum_{m=1}^{4} [\text{ROI}_m]_i\) is the mean of four localized visual tokens. This fine-grained alignment promotes spatial awareness of interactive regions (e.g., focused input boxes or active cursors), improving robustness to UI layout variations.
+where \(\bar{r}_i = \frac{1}{4} \sum_{m=1}^{4} [\text{ROI}_m]_i \in \mathbb{R}^{256}\) is the average-pooled representation of the four localized visual tokens (input field, chat bubble, keyboard, and title bar), and \(\langle \cdot, \cdot \rangle\) denotes the dot product after L2 normalization. This fine-grained alignment encourages the model to associate specific UI regions with contextual intent, improving robustness to layout variations and spatial reasoning for interactive elements.
 
 ### Decoder Loss
 
-The decoder is optimized via a weighted multitask objective that unifies text generation and layout prediction, conditioned on \(h_t\) to ensure multimodal coherence:
+The decoder is optimized via a weighted multitask objective that unifies text generation, task routing, layout prediction, and MoE stability, conditioned on \(h_t\) to ensure multimodal coherence:
 
 $$
 \mathcal{L}_{\text{dec}} =
-\lambda_e \mathcal{L}_e +
-\lambda_c \mathcal{L}_c +
-\lambda_s \mathcal{L}_s +
-\lambda_l \mathcal{L}_l +
+\mathcal{L}_{\text{text}} +
 \lambda_{\text{task}} \mathcal{L}_{\text{task}} +
+\lambda_{\text{layout}} \mathcal{L}_{\text{layout}} +
+\lambda_{\text{consistency}} \mathcal{L}_{\text{consistency}} +
 \lambda_{\text{load}} \mathcal{L}_{\text{load}}
 $$
 
-where \(\mathcal{L}_e\), \(\mathcal{L}_c\), \(\mathcal{L}_s\), and \(\mathcal{L}_l\) correspond to error correction, auto-completion, suggestion, and layout prediction, respectively. Optimal weights \(\boldsymbol{\lambda} = [1.0, 0.8, 0.6, 0.4, 0.5, 0.01]\) are tuned to prioritize high-impact tasks like correction while maintaining MoE stability.
+where $\mathcal{L}_{\text{text}}$ represents the text generation loss (unified across all text tasks), and $\lambda_{\text{task}}{=}0.5$, $\lambda_{\text{layout}}{=}0.4$, $\lambda_{\text{consistency}}{=}0.3$, $\lambda_{\text{load}}{=}0.01$ are empirically tuned weights that balance different objectives.
 
-#### Text-Based Losses
+#### Text Generation Loss
 
-All text tasks are trained with cross-entropy over a shared multilingual vocabulary (\(|V|=32\)K):
+All text generation tasks (error correction, auto-completion, and suggestion) are unified under a single cross-entropy loss over the shared multilingual vocabulary (\(|V|=32,000\)):
 
 $$
-\begin{align}
-\mathcal{L}_e &= -\log p(\hat{w}_t \mid h_t, e_{\text{task}=\texttt{<ERR>}}; \theta) \\
-\mathcal{L}_c &= -\log p(w_{t+1} \mid h_t, e_{\text{task}=\texttt{<COMP>}}, w_t; \theta) \\
-\mathcal{L}_s &= -\sum_{n=1}^{N} \log p(s_{t+n} \mid h_t, e_{\text{task}=\texttt{<SUG>}}, s_{<n}; \theta)
-\end{align}
+\mathcal{L}_{\text{text}} = -\frac{1}{|\mathcal{Y}|} \sum_{i=1}^{|\mathcal{Y}|} \log p(y_i \mid h_t, e_{\text{task}}, \mathbf{y}_{<i}; \theta)
 $$
 
-with \(N=5\) for the suggestion task and teacher forcing during training. Ground-truth targets are derived from user interaction logs, including post-edit corrections and accepted suggestions.
+where \(\mathcal{Y}\) represents the target token sequence, \(y_i\) is the \(i\)-th target token, \(h_t\) is the multimodal context, \(e_{\text{task}}\) is the task-specific embedding, and \(\mathbf{y}_{<i}\) are the previously generated tokens. The loss is computed autoregressively for sequence generation tasks (e.g., suggestion with \(N=5\) tokens) and uses teacher forcing during training. Ground-truth targets are derived from user interaction logs, including post-edit corrections, accepted completions, and validated suggestions.
+
+For different tasks:
+- **Error Correction**: Single-token prediction (\(|\mathcal{Y}|=1\)) replacing the erroneous input
+- **Auto-Completion**: Single-token prediction (\(|\mathcal{Y}|=1\)) extending the current input
+- **Suggestion**: Multi-token sequence (\(|\mathcal{Y}|=5\)) providing contextual alternatives
 
 #### Layout Prediction Loss
 
-The layout decoder is trained with cross-entropy combined with a language–layout consistency regularizer:
+The layout decoder is trained with standard cross-entropy over the five layout classes (EN, ZH, SYM, EMOJI, NUM):
 
 $$
-\mathcal{L}_l = \mathcal{L}_{\text{CE}}(\hat{\ell}_{t+1} \mid h_t; \theta_l) + \beta \, \mathcal{L}_{\text{consistency}}
+\mathcal{L}_{\text{layout}} = -\frac{1}{B} \sum_{b=1}^{B} \log p(\ell_{t+1}^{(b)} \mid h_t^{(b)}; \theta_l)
 $$
 
-where \(\beta=0.3\) and
+where \(\ell_{t+1}^{(b)} \in \{0,1,2,3,4\}\) represents the ground-truth layout class for sample \(b\), and \(p(\cdot)\) is the softmax probability output from the layout router.
+
+#### Language-Layout Consistency Loss
+
+To ensure coherent multilingual behavior, we add a consistency regularizer that penalizes mismatched language-layout pairs:
 
 $$
-\mathcal{L}_{\text{consistency}} = -\log p(\text{Lang}(y_{t+1}) = \hat{\ell}_{t+1} \mid z_t; \theta)
+\mathcal{L}_{\text{consistency}} = -\frac{1}{B} \sum_{b=1}^{B} \log p(\text{Lang}(\mathbf{y}^{(b)}) = \hat{\ell}_{t+1}^{(b)} \mid z_t^{(b)}; \theta)
 $$
 
-penalizes mismatched language–layout pairs (e.g., English text under `<ZH>` mode), promoting coherent multilingual switching.
+where \(\text{Lang}(\mathbf{y})\) is the predicted language of the generated text sequence \(\mathbf{y}\), and \(\hat{\ell}_{t+1}^{(b)}\) is the predicted layout. This loss encourages the model to maintain consistency between the predicted layout mode and the linguistic properties of generated text (e.g., penalizing English text generation under Chinese layout mode).
 
 #### Task Routing Supervision
 
-To guide dynamic task selection, the gating distribution \(g_{\text{task}}\) is supervised using pseudo-labels derived from user actions (e.g., suggestion acceptance implies `<SUG>`):
+To guide dynamic task selection, the task gating distribution \(g_{\text{task}} \in \Delta^2\) is supervised using pseudo-labels derived from user interaction patterns:
 
 $$
-\mathcal{L}_{\text{task}} = -\sum_{i=1}^{3} y_i \log g_{\text{task},i}
+\mathcal{L}_{\text{task}} = -\frac{1}{B} \sum_{b=1}^{B} \sum_{i=1}^{3} y_i^{(b)} \log g_{\text{task},i}^{(b)}
 $$
+
+where \(y_i^{(b)}\) is the one-hot pseudo-label for task \(i\) (correction, completion, suggestion) based on user actions (e.g., backspace implies correction, continued typing implies completion, and suggestion acceptance implies suggestion task). This supervision helps the router learn to associate input patterns with appropriate task types.
 
 #### MoE Load Balancing
 
-To avoid expert collapse in the language MoE, a quadratic load-balancing loss encourages uniform expert utilization:
+To prevent expert collapse and ensure balanced utilization in the language MoE, we apply a quadratic load-balancing loss that encourages uniform routing across the five language experts:
 
 $$
-\mathcal{L}_{\text{load}} = \sum_{i=1}^{5} \left(f_i - \tfrac{1}{5}\right)^2, \quad f_i = \tfrac{1}{B}\sum_{b=1}^{B} g_{b,i}
+\mathcal{L}_{\text{load}} = \sum_{i=1}^{5} \left(f_i - \frac{1}{5}\right)^2
 $$
 
-maintaining \(f_i \approx 0.2\) across the five experts (EN, ZH, SYM, NUM, EMOJI).
+where \(f_i = \frac{1}{B} \sum_{b=1}^{B} g_{b,i}\) is the average routing probability to expert \(i\) across the batch, and the target \(1/5 \approx 0.2\) ensures each expert (EN, ZH, SYM, NUM, EMOJI) receives roughly equal utilization. This loss prevents the model from over-relying on a subset of experts and promotes robust multilingual capabilities.
 
-### Multitask Decoder Loss Components
+### Decoder Loss Components
 
-| Task | Loss Type | Target | Weight | Notes |
-|------|-----------|--------|---------|-------|
-| Error Correction | CE | Corrected token \(\hat{w}_t\) | 1.0 | Single-step |
-| Auto-Completion | CE | Next token \(w_{t+1}\) | 0.8 | Short AR |
-| Suggestion | CE | Sequence \(s_{t+1:N}\) | 0.6 | AR (\(N=5\)) |
-| Layout Prediction | CE + Consistency | Mode \(\ell_{t+1}\) | 0.4 | Hysteresis-aware |
-| Task Routing | CE | Pseudo-label | 0.5 | From logs |
-| MoE Balancing | Quadratic | Uniform \(f_i\) | 0.01 | Anti-collapse |
+| Component | Loss Type | Target | Weight | Notes |
+|-----------|-----------|--------|---------|-------|
+| Text Generation | CE | Token sequences | 1.0 | Unified across all text tasks |
+| Task Routing | CE | Task probabilities | 0.5 | Supervised with pseudo-labels |
+| Layout Prediction | CE | Layout mode \(\ell_{t+1}\) | 0.4 | Cross-entropy over 5 layouts |
+| Consistency | CE | Language-layout match | 0.3 | Penalizes mismatched pairs |
+| MoE Load Balancing | Quadratic | Uniform expert usage | 0.01 | Maintains \(f_i \approx 0.2\)
 
-### Distillation Loss
-
-To enhance efficiency and generalization, we incorporate knowledge distillation from a pretrained multilingual vision–language teacher (e.g., DeepSeek OCR):
-
-$$
-\mathcal{L}_{\text{dist}} = \mathcal{L}_{\text{KL}} + 0.5 \, \mathcal{L}_{\text{feat}}
-$$
-
-where \(\mathcal{L}_{\text{KL}}\) minimizes the divergence between student and teacher token logits, and \(\mathcal{L}_{\text{feat}}\) aligns intermediate encoder representations (\(h_t\)) via mean squared error. This distillation transfers rich multimodal priors, reducing cold-start errors and accelerating adaptation in low-data mobile environments.
 
 ## Summary
 

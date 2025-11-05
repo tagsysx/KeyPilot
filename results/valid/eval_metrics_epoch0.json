@@ -1,0 +1,11 @@
+{
+  "eval/loss": 6.515451572284867,
+  "eval/task_accuracy": 0.8898488253257142,
+  "eval/layout_accuracy": 1.0,
+  "eval/text_accuracy": 0.19242584967477078,
+  "eval/loss_text": 4.4337546702188355,
+  "eval/loss_task": 0.6590592547944464,
+  "eval/loss_layout": 0.9048327207409529,
+  "eval/loss_encoder": 4.623127105632509,
+  "eval/loss_decoder": 5.128513388585437
+}

@@ -2,43 +2,62 @@
 Dataset class for KeyPilot training data.
 """
 
-import json
+import pickle
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 from pathlib import Path
 from loguru import logger
+from transformers import BertTokenizer
 
 
 class KeyPilotDataset(Dataset):
     """
     PyTorch Dataset for KeyPilot training.
     
-    Each sample contains:
-    - Screen image (visual context)
-    - Conversation text (linguistic context)
-    - Next input intent label
-    - Optimal keyboard layout label
+    Supports the pickle format with the following structure:
+    - Task types: error (纠错), completion (补全), suggestion (建议)
+    - Screen images (visual context)
+    - Tokenized text (BERT tokenizer with ## subwords)
+    - Task and layout labels
     """
+    
+    # Task label mapping
+    TASK_LABELS = {
+        0: "suggestion",    # 智能建议
+        1: "completion",    # 自动补全
+        2: "error"          # 错误纠正
+    }
+    
+    # Target type mapping
+    TARGET_TYPES = {
+        0: "chinese",       # 中文
+        1: "english",       # 英文
+        2: "number",        # 数字
+        3: "punctuation",   # 标点
+        4: "emoji"          # 表情
+    }
     
     def __init__(
         self,
         data_path: str,
-        processor: Any,
-        intent_classes: List[str],
-        layout_types: List[str],
+        vocab_path: Optional[str] = None,
+        max_seq_length: int = 128,
+        image_size: tuple = (512, 256),
         max_samples: Optional[int] = None,
+        use_bert_tokenizer: bool = True,
     ):
         """
         Initialize KeyPilot dataset.
         
         Args:
-            data_path: Path to JSON dataset file
-            processor: Processor for encoding images and text
-            intent_classes: List of input intent classes
-            layout_types: List of keyboard layout types
+            data_path: Path to pickle file (e.g., all_samples_343.pkl)
+            vocab_path: Path to vocabulary/tokenizer. If None, uses BERT tokenizer
+            max_seq_length: Maximum sequence length for input tokens
+            image_size: Target image size (H, W)
             max_samples: Optional maximum number of samples to load
+            use_bert_tokenizer: Whether to use BERT tokenizer (recommended: True)
             
         Raises:
             FileNotFoundError: If data_path doesn't exist
@@ -48,30 +67,37 @@ class KeyPilotDataset(Dataset):
         if not data_file.exists():
             raise FileNotFoundError(f"Dataset file not found: {data_path}")
         
-        if not intent_classes:
-            raise ValueError("intent_classes cannot be empty")
-        if not layout_types:
-            raise ValueError("layout_types cannot be empty")
+        self.data_path = data_file
+        self.max_seq_length = max_seq_length
+        self.image_size = image_size
         
-        self.processor = processor
-        self.intent_classes = intent_classes
-        self.layout_types = layout_types
+        # Get base directory for images
+        self.base_dir = data_file.parent
         
-        # Create label mappings
-        self.intent_to_idx = {intent: idx for idx, intent in enumerate(intent_classes)}
-        self.layout_to_idx = {layout: idx for idx, layout in enumerate(layout_types)}
+        # Initialize tokenizer
+        if use_bert_tokenizer:
+            # Use pretrained BERT tokenizer (same as data generation)
+            self.tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+            logger.info("Using BERT multilingual tokenizer")
+        elif vocab_path:
+            from ..utils.vocabulary import KeyPilotVocabulary
+            self.tokenizer = KeyPilotVocabulary()
+            self.tokenizer.load(vocab_path)
+            logger.info(f"Loaded custom tokenizer from {vocab_path}")
+        else:
+            raise ValueError("Either use_bert_tokenizer=True or provide vocab_path")
         
         # Load data
-        logger.info(f"Loading dataset from {data_path}")
+        logger.info(f"Loading dataset from {data_path}...")
         try:
-            with open(data_file, 'r') as f:
-                self.data = json.load(f)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse dataset JSON: {e}")
-            raise ValueError(f"Invalid JSON in dataset file: {e}")
+            with open(data_file, 'rb') as f:
+                self.data = pickle.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load pickle file: {e}")
+            raise ValueError(f"Invalid pickle file: {e}")
         
         if not isinstance(self.data, list):
-            raise ValueError("Dataset must be a JSON array")
+            raise ValueError("Dataset must be a list of samples")
         
         if not self.data:
             raise ValueError("Dataset is empty")
@@ -79,8 +105,20 @@ class KeyPilotDataset(Dataset):
         # Limit samples if specified
         if max_samples is not None and max_samples > 0:
             self.data = self.data[:max_samples]
+            logger.info(f"Limited to {max_samples} samples")
+        
+        # Count task distribution
+        task_counts = {0: 0, 1: 0, 2: 0}
+        for sample in self.data:
+            task_label = sample.get('task_label', 1)
+            task_counts[task_label] = task_counts.get(task_label, 0) + 1
         
         logger.info(f"Loaded {len(self.data)} samples")
+        logger.info(f"Task distribution:")
+        logger.info(f"  - Suggestion (0): {task_counts[0]} ({task_counts[0]/len(self.data)*100:.1f}%)")
+        logger.info(f"  - Completion (1): {task_counts[1]} ({task_counts[1]/len(self.data)*100:.1f}%)")
+        logger.info(f"  - Error (2): {task_counts[2]} ({task_counts[2]/len(self.data)*100:.1f}%)")
+        logger.info(f"Using images from {self.base_dir}")
     
     def __len__(self) -> int:
         """Return number of samples in dataset."""
@@ -94,7 +132,15 @@ class KeyPilotDataset(Dataset):
             idx: Sample index
             
         Returns:
-            Dictionary containing processed inputs and labels
+            Dictionary containing:
+                - image: Screen image tensor [3, H, W]
+                - input_ids: Token IDs [max_seq_length]
+                - attention_mask: Attention mask [max_seq_length]
+                - task_label: Task type (0:suggestion, 1:completion, 2:error)
+                - layout_label: Keyboard layout label
+                - target_token_id: Target token ID (single token for completion/error)
+                - target_type: Token type (0:中文, 1:英文, 2:数字, 3:标点, 4:表情)
+                - For suggestion task: target_token_ids (multiple tokens)
             
         Raises:
             IndexError: If idx is out of range
@@ -104,52 +150,129 @@ class KeyPilotDataset(Dataset):
         
         sample = self.data[idx]
         
-        # Note: In practice, you would load actual screen images
-        # For now, we create a placeholder image from screen description
-        # In real implementation, screen_image_path should be in the data
-        image = self._create_placeholder_image(sample.get('screen_description', ''))
+        # 1. Load and process image
+        image_path = self.base_dir / sample['image_path']
+        if image_path.exists():
+            try:
+                image = Image.open(image_path).convert('RGB')
+                # Resize to target size
+                image = image.resize((self.image_size[1], self.image_size[0]))  # (W, H)
+            except Exception as e:
+                logger.warning(f"Failed to load image {image_path}: {e}. Using black image.")
+                image = Image.new('RGB', (self.image_size[1], self.image_size[0]), color='black')
+        else:
+            logger.warning(f"Image not found: {image_path}. Using black image.")
+            image = Image.new('RGB', (self.image_size[1], self.image_size[0]), color='black')
         
-        # Get text
-        conversation_text = sample.get('conversation_text', '')
+        # Convert image to tensor [3, H, W]
+        import torchvision.transforms as transforms
+        image_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        image_tensor = image_transform(image)
         
-        # Process inputs
-        inputs = self.processor(
-            text=conversation_text,
-            images=image,
-            return_tensors="pt",
-            padding="max_length",
+        # 2. Process input tokens
+        input_tokens = sample.get('input_tokens', [])
+        
+        # Convert tokens to text (BERT tokenizer can handle this)
+        # Join tokens and let BERT tokenizer re-tokenize
+        input_text = self._tokens_to_text(input_tokens)
+        
+        # Tokenize with BERT
+        encoded = self.tokenizer(
+            input_text,
+            max_length=self.max_seq_length,
+            padding='max_length',
             truncation=True,
+            return_tensors='pt'
         )
         
-        # Remove batch dimension added by processor
-        inputs = {k: v.squeeze(0) for k, v in inputs.items()}
+        input_ids = encoded['input_ids'].squeeze(0)  # [max_seq_length]
+        attention_mask = encoded['attention_mask'].squeeze(0)  # [max_seq_length]
         
-        # Get labels
-        intent = sample.get('next_intent', 'text')
-        layout = sample.get('optimal_layout', 'qwerty')
+        # 3. Process target
+        task_label = sample.get('task_label', 1)
+        max_target_length = 32  # Unified max length for all tasks
         
-        # Map to indices (with fallback to default)
-        intent_idx = self.intent_to_idx.get(intent, 0)
-        layout_idx = self.layout_to_idx.get(layout, 0)
+        if task_label == 0:  # Suggestion task
+            # Multiple target tokens
+            target_tokens = sample.get('target_tokens', [])
+            target_text = self._tokens_to_text(target_tokens)
+            target_encoded = self.tokenizer(
+                target_text,
+                max_length=max_target_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            target_token_ids = target_encoded['input_ids'].squeeze(0)  # [32]
+            target_length = (target_encoded['attention_mask'].squeeze(0) == 1).sum().item()
+        else:  # Completion or Error task
+            # Single target token - pad to max_target_length for consistent batching
+            target_token = sample.get('target_token', '')
+            target_token_id = self.tokenizer.convert_tokens_to_ids(target_token)
+            if target_token_id is None:
+                target_token_id = self.tokenizer.unk_token_id
+            
+            # Create padded tensor [32] with target at first position
+            target_token_ids = torch.full((max_target_length,), self.tokenizer.pad_token_id, dtype=torch.long)
+            target_token_ids[0] = target_token_id
+            target_length = 1
         
-        inputs['intent_label'] = torch.tensor(intent_idx, dtype=torch.long)
-        inputs['layout_label'] = torch.tensor(layout_idx, dtype=torch.long)
+        # 4. Other labels
+        layout_label = sample.get('layout_label', 0)
+        target_type = sample.get('target_type', 1)
         
-        return inputs
+        # 5. Build output dictionary
+        # Note: All samples must have the same keys for DataLoader batching
+        output = {
+            'image': image_tensor,
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'task_label': torch.tensor(task_label, dtype=torch.long),
+            'layout_label': torch.tensor(layout_label, dtype=torch.long),
+            'target_token_ids': target_token_ids,  # [32] for all tasks
+            'target_length': torch.tensor(target_length, dtype=torch.long),  # Actual number of target tokens
+            'target_type': torch.tensor(target_type, dtype=torch.long),
+            # Add typo fields for all samples (only meaningful for error tasks)
+            'typo_position': torch.tensor(sample.get('typo_position', -1), dtype=torch.long),
+        }
+        
+        return output
     
-    def _create_placeholder_image(self, description: str) -> Image.Image:
+    def _tokens_to_text(self, tokens: List[str]) -> str:
         """
-        Create a placeholder image.
-        
-        In real implementation, this would load actual screen images.
+        Convert BERT-style tokens back to text.
         
         Args:
-            description: Screen description text
+            tokens: List of tokens (with ## for subwords)
             
         Returns:
-            PIL Image
+            Reconstructed text string
         """
-        # Create a simple placeholder image
-        # In practice, you would load actual screen captures
-        return Image.new('RGB', (224, 224), color='white')
+        if not tokens:
+            return ""
+        
+        # Join tokens, handling ## subword markers
+        text = ""
+        for token in tokens:
+            if token.startswith('##'):
+                # Subword: append without space
+                text += token[2:]
+            else:
+                # New word: add space if not first token
+                if text:
+                    text += " "
+                text += token
+        
+        return text.strip()
+    
+    def get_task_name(self, task_label: int) -> str:
+        """Get task name from label."""
+        return self.TASK_LABELS.get(task_label, "unknown")
+    
+    def get_target_type_name(self, target_type: int) -> str:
+        """Get target type name from label."""
+        return self.TARGET_TYPES.get(target_type, "unknown")
 

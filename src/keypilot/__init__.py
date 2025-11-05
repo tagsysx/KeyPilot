@@ -9,13 +9,16 @@ and conversation history.
 __version__ = "0.1.0"
 __author__ = "KeyPilot Team"
 
-from .models.vlm import KeyPilotVLM
-from .training.trainer import KeyPilotTrainer
+from .models import KeyPilotVLM, KeyPilotEncoder, KeyPilotDecoder, KeyPilotLoss
+from .data.dataset import KeyPilotDataset
 from .evaluation.evaluator import KeyPilotEvaluator
 
 __all__ = [
     "KeyPilotVLM",
-    "KeyPilotTrainer",
+    "KeyPilotEncoder",
+    "KeyPilotDecoder",
+    "KeyPilotLoss",
+    "KeyPilotDataset",
     "KeyPilotEvaluator",
 ]
 

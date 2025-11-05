@@ -15,7 +15,7 @@ from sklearn.metrics import (
     classification_report,
 )
 
-from ..models.vlm import KeyPilotVLM
+from ..models.model import KeyPilotVLM
 from ..data.dataset import KeyPilotDataset
 
 
